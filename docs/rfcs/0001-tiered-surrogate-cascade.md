@@ -3,7 +3,7 @@
 - **Status:** Draft / discussion
 - **Author:** Narasimhan Rengan
 - **Relates to:** the TRACER paper (Rida, 2026, arXiv:2604.14531) — Limitations
-  §1 (calibration→test gap), §3 (mimics teacher), §6 (frozen embeddings); and
+  §1 (calibration→test gap), §2 (mimics teacher), §3 (frozen embeddings); and
   issues #38, #45.
 
 This document captures a design discussion about how to extend TRACER beyond a
@@ -54,15 +54,17 @@ microseconds on CPU; refitting it is seconds.
 
 A small *decoder* LLM as the surrogate changes that:
 
-| Property            | Classical surrogate | Small decoder LLM (≈1B) |
-| ------------------- | ------------------- | ----------------------- |
-| Inference latency   | microseconds, CPU   | ~100ms–1s; GPU-preferred |
-| Marginal cost       | ~free               | real (GPU amortization) |
-| Refit cost (flywheel)| seconds            | minutes–hours (LoRA)    |
-| Deploy artifact     | one `joblib` file   | model server + weights  |
+| Property            | Classical surrogate | Fine-tuned encoder (≈100–400M) | Small decoder LLM (≈1B) |
+| ------------------- | ------------------- | ------------------------------ | ----------------------- |
+| Inference latency   | microseconds, CPU   | ~50–500ms single-stream, CPU   | ~100ms–1s; GPU-preferred |
+| Marginal cost       | ~free               | small but nonzero (CPU)        | real (GPU amortization) |
+| Refit cost (flywheel)| seconds            | minutes (head / LoRA tune)     | minutes–hours (LoRA)    |
+| Deploy artifact     | one `joblib` file   | weights + tokenizer, self-contained | model server + weights |
 
 So "small LLM **instead of** ML" weakens the headline metric. We must not frame
-it as a replacement.
+it as a replacement. Honesty note: **Tier 1 also breaks the microseconds
+story**, just less — "least threat to the cost moat" (§7) is relative, and the
+benchmark's cost model must include Tier 1's own row rather than hide it.
 
 ## 3. Proposal A — Cost-tiered surrogate cascade
 
@@ -95,22 +97,76 @@ cannot* have:
 3. **Structured outputs** — JSON, multi-label, rationale strings.
 4. **Cold start** — a pretrained small LLM has priors, so day-1-with-50-traces
    it may beat a from-scratch classifier. Attacks the flywheel's slowest phase.
+   Capped by the gate, though: at α=0.95, δ=0.1 the Clopper–Pearson bound needs
+   ~45 zero-disagreement calibration rows in the accepted pool before *any*
+   tier can be certified (see RFC 0004 §7) — the gate, not the model, sets the
+   cold-start floor. The zero-shot tier raises quality so certification arrives
+   as early as the math allows, but not earlier.
 5. **Multi-task** — one tuned small LLM serving many endpoints.
 
-### 3.2 Sketch: slotting a tier into the zoo
+### 3.2 The cascade already exists in the code — build on it
 
-`search_best_surrogate()` / `_candidates()` already return scored candidates.
-A new tier is a candidate that:
+Two extension points exist today, and they are different things:
+
+- **Within a stage**, `search_best_surrogate()` / `_candidates()` train a zoo
+  of candidates that *compete*; one winner deploys.
+- **Across stages**, `build_rsb()` already implements a residual cascade —
+  stage 2 trains on the rows stage 1's gate rejects — and `route_pipeline()`
+  generically walks an ordered stage list, first-accept-wins. The runtime
+  router calls straight through it.
+
+Tiers must be **stages, not candidates**: cascade semantics (easy → Tier 0,
+medium → Tier 1, hard → teacher) require sequential composition, whereas the
+zoo picks a single winner. The clean design uses both: generalize `build_rsb`
+→ `build_cascade(tiers=[...])`, where each tier is a stage trained on the
+previous tier's residual with its own acceptor and parity gate, and keep the
+zoo competing *within* each tier. (This also answers open question 8.3: the
+codebase has already chosen per-input routing, via the RSB residual
+structure.)
+
+The per-candidate contract inside a tier stays as before. Each candidate:
 
 - exposes `predict_proba`-equivalent **calibrated** scores so the existing
   acceptor features still apply (decoder LLMs: derive from token logprobs and/or
-  self-consistency; verbalized confidence is *not* enough);
+  self-consistency; verbalized confidence is *not* enough). Note the acceptor
+  (`_fit_acceptor`) is itself a *learned recalibration layer* trained on actual
+  correctness — it can absorb much of a decoder's logprob miscalibration,
+  provided the tier yields a full label-probability vector (one logit-masked
+  forward pass, not one scoring call per label) for the entropy/margin
+  features;
 - for decoder tiers, uses **constrained decoding** (outlines /
   lm-format-enforcer / logit masking to the label set) so it cannot emit an
   off-label class;
 - carries a **cost tag** (est. ms + $/1k inferences incl. GPU amortization) so
   selection can prefer the cheapest tier that clears α, not just the most
   accurate.
+
+### 3.3 Plumbing changes the cascade actually needs
+
+The current pipeline is embedding-in end-to-end; Tier 1+ breaks that
+assumption. Concretely:
+
+- **Stage API.** `apply_stage(stage, X)` and `route_pipeline()` receive only
+  embedding arrays, and `Router.predict` enforces `manifest.embedding_dim`.
+  Tier 1/2/3 consume raw text, so the stage interface must carry
+  `(text, embedding)` pairs; text is already available at the `Router` surface
+  when an embedder is attached, but never reaches the stages.
+- **Serving surfaces.** `tracer serve` and the JS integration POST
+  *embeddings*; both need a text-in mode before any text-consuming tier can
+  run behind them.
+- **Trace schema.** Tier 2 (cross-encoder) needs premise/hypothesis as
+  separate fields; traces are `{"input": str, "teacher": str}` today.
+  Concatenation is fine for frozen embeddings but defeats the purpose of a
+  cross-encoder — the schema needs a structured-input variant.
+- **Cost-aware selection happens at two levels.** Candidate-within-stage
+  selection is pure macro-F1 (`search_best_surrogate`), and the frontier's
+  method selection keys on (coverage, TA, −n_stages) — neither has a cost
+  term. The cost tag from §3.2 must reach both.
+- **Fit-time cost, not just inference cost.** The sweep trains and evaluates
+  every candidate on every refit, and `tracer.update()` refits on every
+  flywheel turn — a LoRA tier in the default sweep turns a seconds-long refit
+  into minutes–hours. Heavy tiers should refit **lazily**: only when Tier 0's
+  certified coverage plateaus or the residual mass crosses a floor.
 
 ## 4. Proposal B — Per-class (Mondrian) conformal parity gate
 
@@ -145,8 +201,11 @@ decide everything:
 A "no" on (2) for some task is itself a finding: it maps exactly which task
 regimes justify the heavier tier.
 
-Add a RouteLLM-style learned-router baseline so the comparison answers the
-paper's "limited baselines" limitation at the same time.
+Add a RouteLLM-style learned-router baseline. The paper's evaluation has a
+single baseline (a confidence-threshold LR with full hindsight), so this
+strengthens the comparison — note this addresses a *weakness*, not a stated
+limitation: "limited baselines" does not appear in the paper's limitations
+(its §4 is limited *task* coverage).
 
 ## 6. Risks / non-goals
 
@@ -154,7 +213,7 @@ paper's "limited baselines" limitation at the same time.
   tracer-llm[local]`), never the default, or OSS adoption suffers.
 - **Calibration.** Decoder confidence is unreliable → constrained decoding +
   the per-class conformal gate are required, not optional.
-- **Still mimics the teacher** (paper §3). Distillation can't beat the teacher
+- **Still mimics the teacher** (paper §2). Distillation can't beat the teacher
   without mixing in ground truth; sell *coverage on previously-undeployable
   tasks* + cost, not accuracy gains.
 - **Ops burden.** A model server is heavier than a `joblib` file; keep Tier 0
@@ -178,4 +237,5 @@ paper's "limited baselines" limitation at the same time.
 - What's the minimum trace volume at which each tier first clears α? (Informs
   the cold-start story.)
 - Should tier selection be per-policy or per-input (a true cascade vs. a single
-  chosen tier)?
+  chosen tier)? (§3.2 argues the code has already answered: per-input, via the
+  RSB residual structure.)

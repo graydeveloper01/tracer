@@ -231,10 +231,28 @@ Run on the paper's three datasets via the benchmark harness (RFC 0002 Tier 2):
   one, so total coverage at fixed α falls — the honest price of the guarantee.
   Mitigations: LTT is less conservative than union-bounded CP; only genuinely
   uncertifiable classes are deferred.
-- **Data hunger.** C classes × few calibration rows each ⇒ many deferred classes
-  on small data. This interacts with cold start; the gate must degrade gracefully
-  (defer, never crash), consistent with the current philosophy. `min_certify_n`
-  makes the cutoff explicit.
+- **Data hunger — quantified.** `_cp_lower` at δ=0.1 needs the following
+  class-conditional calibration mass just to certify a class:
+
+  | α | min rows/class (zero disagreements) | with one disagreement |
+  |---|---|---|
+  | 0.90 | 22 | 38 |
+  | 0.95 | 45 | 77 |
+  | 0.98 | 114 | 194 |
+
+  Under the current `max_fit_labels=8000` cap the calibration split is ≈1,600
+  rows — ~21/class on Banking77 and ~11/class on CLINC150 — so at α=0.95
+  Backend A certifies **zero classes on both headline datasets even with
+  perfect agreement**. The proposal is vacuous at paper-scale data unless at
+  least one of: (i) the fit cap is raised and ~45–77·C calibration rows are
+  collected, (ii) δ is relaxed per class, or (iii) rare classes are pooled into
+  **grouped Mondrian strata** (cluster-level buckets instead of singleton
+  classes) — the standard Mondrian escape hatch, and the recommended addition
+  to this RFC. The same math caps the cold-start story in RFC 0001 §3.1: even
+  a perfect zero-shot tier cannot be certified before ~45 traces at α=0.95 —
+  the gate, not the model, is the cold-start floor. `min_certify_n` makes the
+  cutoff explicit; the gate must still degrade gracefully (defer, never
+  crash), consistent with the current philosophy.
 - **Multiplicity.** Scanning τ per class over a grid inflates the effective error
   rate; naive per-class point thresholds (cf. #44) are *not* valid. Backend B
   (LTT / fixed-sequence, Bonferroni across classes) is the rigorous answer;
@@ -259,7 +277,13 @@ Run on the paper's three datasets via the benchmark harness (RFC 0002 Tier 2):
    but gives a single global statement.
 3. **Ground-truth mode:** when `ground_truth` is present, also report per-class
    *accuracy* bounds alongside teacher-agreement bounds (supports the paper's
-   ground-truth-vs-teacher analysis, Limitation §3)?
+   ground-truth-vs-teacher analysis, Limitation §2)?
 4. **RSB interaction:** per-class thresholds are per stage; confirm the residual
    split (`build_rsb`) still leaves enough per-class calibration mass at stage 2,
-   or fall back to a global stage-2 gate when it doesn't.
+   or fall back to a global stage-2 gate when it doesn't. Note per-class ×
+   per-stage strata shrink geometrically down a cascade (RFC 0001) — the two
+   proposals compose statistically but *compete for the same calibration rows*.
+5. **Stratum grouping:** given the certification-mass table in §7, should
+   grouped Mondrian strata (pooling rare classes into buckets) ship in the
+   initial implementation rather than as a follow-up? How are buckets chosen —
+   embedding clusters, confusion-graph communities, or simple frequency bands?
